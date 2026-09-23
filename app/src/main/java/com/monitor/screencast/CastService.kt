@@ -139,31 +139,34 @@ class CastService : Service() {
     }
 
     private fun sendFrame(jpeg: ByteArray) {
-        var conn: HttpURLConnection? = null
-        try {
-            conn = URL(url).openConnection() as HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.doOutput = true
-            conn.connectTimeout = 2000
-            conn.readTimeout = 2000
-            conn.setFixedLengthStreamingMode(jpeg.size)
-            conn.setRequestProperty("Content-Type", "application/octet-stream")
-            conn.outputStream.use { it.write(jpeg) }
-            val code = conn.responseCode
-            if (code in 200..299) sentCount++ else errCount++
-        } catch (e: Exception) {
-            errCount++
-        } finally {
-            conn?.disconnect()
-        }
+    var socket: java.net.Socket? = null
+    try {
+        socket = java.net.Socket()
+        socket.connect(java.net.InetSocketAddress(host, 8081), 2000)
+        socket.soTimeout = 2000
+        val out = socket.outputStream
+        val size = jpeg.size
+        out.write(byteArrayOf(
+            ((size shr 24) and 0xFF).toByte(),
+            ((size shr 16) and 0xFF).toByte(),
+            ((size shr 8) and 0xFF).toByte(),
+            (size and 0xFF).toByte()
+        ))
+        out.write(jpeg)
+        out.flush()
+        sentCount++
+    } catch (e: Exception) {
+        errCount++
+    } finally {
+        try { socket?.close() } catch (_: Exception) {}
+    }
 
-        val now = System.currentTimeMillis()
-        if (now - lastNotif > 2000) {
-            lastNotif = now
-            handler.post {
-                val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-                nm.notify(1, buildNotification("Sent: $sentCount | Err: $errCount | $url"))
-            }
+    val now = System.currentTimeMillis()
+    if (now - lastNotif > 2000) {
+        lastNotif = now
+        handler.post {
+            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(1, buildNotification("Sent: $sentCount | Err: $errCount | $host:8081"))
         }
     }
 
