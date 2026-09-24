@@ -7,38 +7,56 @@ import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import java.io.ByteArrayOutputStream
+import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
-import java.util.concurrent.Executors
 
 class CastService : Service() {
 
-    private val CW = 480   // capture width
-    private val CH = 640   // capture height
-    private val SW = 240   // send width  (ESP32 screen)
-    private val SH = 320   // send height
+    private val CW = 480
+    private val CH = 640
+    private val SW = 240
+    private val SH = 320
+    private val PORT = 8081
 
     private var projection: MediaProjection? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var reader: ImageReader? = null
-    private val sender = Executors.newSingleThreadExecutor()
+
+    private var captureThread: HandlerThread? = null
+    private var captureHandler: Handler? = null
     private val handler = Handler(Looper.getMainLooper())
 
-    private var intervalMs = 100L
-    private var quality = 60
+    // Переиспользуемые объекты (без GC-пауз)
+    private var rawBitmap: Bitmap? = null
+    private var outBitmap: Bitmap? = null
+    private var outCanvas: Canvas? = null
+    private val jpegOut = ByteArrayOutputStream(64 * 1024)
+
+    // Постоянное соединение
+    private var socket: Socket? = null
+    private var sockOut: OutputStream? = null
+
+    private var intervalMs = 66L   // ~15 fps по умолчанию
+    private var quality = 75
+    private var rotDeg = 0
     private var host = "192.168.1.102"
-    private val port = 8081
     private var lastSend = 0L
     private var sentCount = 0L
     private var errCount = 0L
@@ -50,19 +68,18 @@ class CastService : Service() {
         if (intent == null) { stopSelf(); return START_NOT_STICKY }
 
         host = intent.getStringExtra("ip") ?: "192.168.1.102"
-        val fps = intent.getIntExtra("fps", 10)
-        quality = intent.getIntExtra("quality", 60)
+        val fps = intent.getIntExtra("fps", 15)
+        quality = intent.getIntExtra("quality", 75)
+        rotDeg = intent.getIntExtra("rot", 0)
         intervalMs = (1000L / fps.coerceIn(1, 20))
 
-        // 1) СНАЧАЛА startForeground (требование API 29+/34)
-        val notif = buildNotification("Connecting to $host:$port ...")
+        val notif = buildNotification("Connecting to $host:$PORT ...")
         if (Build.VERSION.SDK_INT >= 29) {
             startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         } else {
             startForeground(1, notif)
         }
 
-        // 2) ПОТОМ getMediaProjection
         val resultCode = intent.getIntExtra("resultCode", 0)
         @Suppress("DEPRECATION")
         val data = intent.getParcelableExtra<Intent>("data")
@@ -81,7 +98,10 @@ class CastService : Service() {
     }
 
     private fun startCapture() {
-        reader = ImageReader.newInstance(CW, CH, PixelFormat.RGBA_8888, 3)
+        captureThread = HandlerThread("cast-capture").apply { start() }
+        captureHandler = Handler(captureThread!!.looper)
+
+        reader = ImageReader.newInstance(CW, CH, PixelFormat.RGBA_8888, 2)
 
         virtualDisplay = projection?.createVirtualDisplay(
             "ESP32Cast",
@@ -89,8 +109,11 @@ class CastService : Service() {
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             reader!!.surface,
             null,
-            handler
+            captureHandler
         )
+
+        outBitmap = Bitmap.createBitmap(SW, SH, Bitmap.Config.ARGB_8888)
+        outCanvas = Canvas(outBitmap!!)
 
         reader!!.setOnImageAvailableListener({ r ->
             val image = r.acquireLatestImage() ?: return@setOnImageAvailableListener
@@ -101,71 +124,125 @@ class CastService : Service() {
             }
             lastSend = now
 
-            val bmp = imageToBitmap(image)
+            grabToRawBitmap(image)
             image.close()
-            if (bmp != null) {
-                val small = Bitmap.createScaledBitmap(bmp, SW, SH, true)
-                if (small !== bmp) bmp.recycle()
-                val jpeg = bitmapToJpeg(small)
-                small.recycle()
-                sender.execute { sendFrame(jpeg) }
-            }
-        }, handler)
+
+            val jpeg = renderAndCompress()
+            if (jpeg != null) sendFrame(jpeg)
+        }, captureHandler)
     }
 
-    private fun imageToBitmap(image: android.media.Image): Bitmap? {
+    private fun grabToRawBitmap(image: Image) {
+        val plane = image.planes[0]
+        val buffer = plane.buffer
+        val pixelStride = plane.pixelStride
+        val rowStride = plane.rowStride
+        val rowPadding = rowStride - pixelStride * CW
+        val needW = CW + rowPadding / pixelStride
+
+        if (rawBitmap == null || rawBitmap!!.width != needW) {
+            rawBitmap?.recycle()
+            rawBitmap = Bitmap.createBitmap(needW, CH, Bitmap.Config.ARGB_8888)
+        }
+        buffer.rewind()
+        rawBitmap!!.copyPixelsFromBuffer(buffer)
+    }
+
+    // Поворот через canvas + letterbox, без лишних аллокаций
+    private fun renderAndCompress(): ByteArray? {
+        val raw = rawBitmap ?: return null
+        val out = outBitmap ?: return null
+        val canvas = outCanvas ?: return null
         return try {
-            val plane = image.planes[0]
-            val buffer = plane.buffer
-            val pixelStride = plane.pixelStride
-            val rowStride = plane.rowStride
-            val rowPadding = rowStride - pixelStride * CW
-            val raw = Bitmap.createBitmap(
-                CW + rowPadding / pixelStride, CH,
-                Bitmap.Config.ARGB_8888
+            val srcW: Int
+            val srcH: Int
+            val swap = (rotDeg == 90 || rotDeg == 270)
+            if (swap) {
+                // исходный контент в raw повёрнут: учитываем при вписывании
+                srcW = if (raw.width > CW) CW else raw.width
+                srcH = CH
+            } else {
+                srcW = if (raw.width > CW) CW else raw.width
+                srcH = CH
+            }
+
+            val scale: Float
+            val dw: Int
+            val dh: Int
+            if (swap) {
+                scale = minOf(SW.toFloat() / srcH, SH.toFloat() / srcW)
+                dw = (srcH * scale).toInt()
+                dh = (srcW * scale).toInt()
+            } else {
+                scale = minOf(SW.toFloat() / srcW, SH.toFloat() / srcH)
+                dw = (srcW * scale).toInt()
+                dh = (srcH * scale).toInt()
+            }
+
+            canvas.drawColor(Color.BLACK)
+            canvas.save()
+            canvas.rotate(rotDeg.toFloat(), SW / 2f, SH / 2f)
+            canvas.drawBitmap(
+                raw,
+                Rect(0, 0, srcW, srcH),
+                Rect((SW - dw) / 2, (SH - dh) / 2, (SW + dw) / 2, (SH + dh) / 2),
+                null
             )
-            buffer.rewind()
-            raw.copyPixelsFromBuffer(buffer)
-            if (rowPadding > 0) {
-                val cropped = Bitmap.createBitmap(raw, 0, 0, CW, CH)
-                if (cropped !== raw) raw.recycle()
-                cropped
-            } else raw
+            canvas.restore()
+
+            jpegOut.reset()
+            out.compress(Bitmap.CompressFormat.JPEG, quality, jpegOut)
+            jpegOut.toByteArray()
         } catch (e: Exception) {
             null
         }
     }
 
-    private fun bitmapToJpeg(bmp: Bitmap): ByteArray {
-        val out = ByteArrayOutputStream()
-        bmp.compress(Bitmap.CompressFormat.JPEG, quality, out)
-        return out.toByteArray()
+    private fun ensureSocket(): Boolean {
+        val s = socket
+        if (s != null && s.isConnected && !s.isClosed && sockOut != null) return true
+        closeSocket()
+        return try {
+            val ns = Socket()
+            ns.connect(InetSocketAddress(host, PORT), 1500)
+            ns.tcpNoDelay = true          // отключаем Nagle — меньше задержка
+            ns.soTimeout = 2000
+            ns.sendBufferSize = 64 * 1024
+            sockOut = ns.outputStream
+            socket = ns
+            true
+        } catch (e: Exception) {
+            closeSocket()
+            false
+        }
     }
 
-    // ===== СЫРОЙ TCP: [4 байта длины BE] + [JPEG] =====
-    private fun sendFrame(jpeg: ByteArray) {
-        var socket: Socket? = null
-        try {
-            socket = Socket()
-            socket.connect(InetSocketAddress(host, port), 2000)
-            socket.soTimeout = 2000
-            val out = socket.outputStream
+    private fun closeSocket() {
+        try { socket?.close() } catch (_: Exception) {}
+        socket = null
+        sockOut = null
+    }
 
-            val size = jpeg.size
-            // 4 байта длины в big-endian
-            out.write(byteArrayOf(
-                ((size shr 24) and 0xFF).toByte(),
-                ((size shr 16) and 0xFF).toByte(),
-                ((size shr 8)  and 0xFF).toByte(),
-                ( size         and 0xFF).toByte()
-            ))
-            out.write(jpeg)
-            out.flush()
-            sentCount++
-        } catch (e: Exception) {
+    private fun sendFrame(jpeg: ByteArray) {
+        if (!ensureSocket()) {
             errCount++
-        } finally {
-            try { socket?.close() } catch (_: Exception) {}
+        } else {
+            try {
+                val out = sockOut!!
+                val size = jpeg.size
+                out.write(byteArrayOf(
+                    ((size shr 24) and 0xFF).toByte(),
+                    ((size shr 16) and 0xFF).toByte(),
+                    ((size shr 8) and 0xFF).toByte(),
+                    (size and 0xFF).toByte()
+                ))
+                out.write(jpeg)
+                out.flush()
+                sentCount++
+            } catch (e: Exception) {
+                errCount++
+                closeSocket()   // следующий кадр переподключится
+            }
         }
 
         val now = System.currentTimeMillis()
@@ -173,9 +250,7 @@ class CastService : Service() {
             lastNotif = now
             handler.post {
                 val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-                nm.notify(1, buildNotification(
-                    "Sent: $sentCount | Err: $errCount | $host:$port"
-                ))
+                nm.notify(1, buildNotification("Sent: $sentCount | Err: $errCount | $host:$PORT"))
             }
         }
     }
@@ -184,11 +259,7 @@ class CastService : Service() {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         var ch = nm.getNotificationChannel("cast")
         if (ch == null) {
-            ch = NotificationChannel(
-                "cast",
-                "Screen Cast",
-                NotificationManager.IMPORTANCE_LOW
-            )
+            ch = NotificationChannel("cast", "Screen Cast", NotificationManager.IMPORTANCE_LOW)
             nm.createNotificationChannel(ch)
         }
         return Notification.Builder(this, "cast")
@@ -205,7 +276,10 @@ class CastService : Service() {
             reader?.close()
             projection?.stop()
         } catch (e: Exception) { }
-        sender.shutdownNow()
+        closeSocket()
+        captureThread?.quitSafely()
+        rawBitmap?.recycle()
+        outBitmap?.recycle()
         super.onDestroy()
     }
 }
