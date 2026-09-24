@@ -10,7 +10,6 @@ import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
-import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -19,8 +18,8 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import java.io.ByteArrayOutputStream
-import java.net.HttpURLConnection
-import java.net.URL
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.util.concurrent.Executors
 
 class CastService : Service() {
@@ -38,7 +37,8 @@ class CastService : Service() {
 
     private var intervalMs = 100L
     private var quality = 60
-    private var url = "http://192.168.1.102/frame"
+    private var host = "192.168.1.102"
+    private val port = 8081
     private var lastSend = 0L
     private var sentCount = 0L
     private var errCount = 0L
@@ -49,19 +49,20 @@ class CastService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent == null) { stopSelf(); return START_NOT_STICKY }
 
-        val ip = intent.getStringExtra("ip") ?: "192.168.1.102"
+        host = intent.getStringExtra("ip") ?: "192.168.1.102"
         val fps = intent.getIntExtra("fps", 10)
         quality = intent.getIntExtra("quality", 60)
         intervalMs = (1000L / fps.coerceIn(1, 20))
-        url = "http://$ip/frame"
 
-        val notif = buildNotification("Connecting to $ip ...")
+        // 1) СНАЧАЛА startForeground (требование API 29+/34)
+        val notif = buildNotification("Connecting to $host:$port ...")
         if (Build.VERSION.SDK_INT >= 29) {
             startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
         } else {
             startForeground(1, notif)
         }
 
+        // 2) ПОТОМ getMediaProjection
         val resultCode = intent.getIntExtra("resultCode", 0)
         @Suppress("DEPRECATION")
         val data = intent.getParcelableExtra<Intent>("data")
@@ -112,14 +113,17 @@ class CastService : Service() {
         }, handler)
     }
 
-    private fun imageToBitmap(image: Image): Bitmap? {
+    private fun imageToBitmap(image: android.media.Image): Bitmap? {
         return try {
             val plane = image.planes[0]
             val buffer = plane.buffer
             val pixelStride = plane.pixelStride
             val rowStride = plane.rowStride
             val rowPadding = rowStride - pixelStride * CW
-            val raw = Bitmap.createBitmap(CW + rowPadding / pixelStride, CH, Bitmap.Config.ARGB_8888)
+            val raw = Bitmap.createBitmap(
+                CW + rowPadding / pixelStride, CH,
+                Bitmap.Config.ARGB_8888
+            )
             buffer.rewind()
             raw.copyPixelsFromBuffer(buffer)
             if (rowPadding > 0) {
@@ -138,35 +142,41 @@ class CastService : Service() {
         return out.toByteArray()
     }
 
+    // ===== СЫРОЙ TCP: [4 байта длины BE] + [JPEG] =====
     private fun sendFrame(jpeg: ByteArray) {
-    var socket: java.net.Socket? = null
-    try {
-        socket = java.net.Socket()
-        socket.connect(java.net.InetSocketAddress(host, 8081), 2000)
-        socket.soTimeout = 2000
-        val out = socket.outputStream
-        val size = jpeg.size
-        out.write(byteArrayOf(
-            ((size shr 24) and 0xFF).toByte(),
-            ((size shr 16) and 0xFF).toByte(),
-            ((size shr 8) and 0xFF).toByte(),
-            (size and 0xFF).toByte()
-        ))
-        out.write(jpeg)
-        out.flush()
-        sentCount++
-    } catch (e: Exception) {
-        errCount++
-    } finally {
-        try { socket?.close() } catch (_: Exception) {}
-    }
+        var socket: Socket? = null
+        try {
+            socket = Socket()
+            socket.connect(InetSocketAddress(host, port), 2000)
+            socket.soTimeout = 2000
+            val out = socket.outputStream
 
-    val now = System.currentTimeMillis()
-    if (now - lastNotif > 2000) {
-        lastNotif = now
-        handler.post {
-            val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-            nm.notify(1, buildNotification("Sent: $sentCount | Err: $errCount | $host:8081"))
+            val size = jpeg.size
+            // 4 байта длины в big-endian
+            out.write(byteArrayOf(
+                ((size shr 24) and 0xFF).toByte(),
+                ((size shr 16) and 0xFF).toByte(),
+                ((size shr 8)  and 0xFF).toByte(),
+                ( size         and 0xFF).toByte()
+            ))
+            out.write(jpeg)
+            out.flush()
+            sentCount++
+        } catch (e: Exception) {
+            errCount++
+        } finally {
+            try { socket?.close() } catch (_: Exception) {}
+        }
+
+        val now = System.currentTimeMillis()
+        if (now - lastNotif > 2000) {
+            lastNotif = now
+            handler.post {
+                val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                nm.notify(1, buildNotification(
+                    "Sent: $sentCount | Err: $errCount | $host:$port"
+                ))
+            }
         }
     }
 
@@ -174,7 +184,11 @@ class CastService : Service() {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         var ch = nm.getNotificationChannel("cast")
         if (ch == null) {
-            ch = NotificationChannel("cast", "Screen Cast", NotificationManager.IMPORTANCE_LOW)
+            ch = NotificationChannel(
+                "cast",
+                "Screen Cast",
+                NotificationManager.IMPORTANCE_LOW
+            )
             nm.createNotificationChannel(ch)
         }
         return Notification.Builder(this, "cast")
